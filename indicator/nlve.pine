@@ -1,0 +1,922 @@
+//@version=6
+indicator("NLVE - NUVORO Liquidity Volume Engine", overlay=true)
+
+//==================================================
+// INPUTS
+//==================================================
+
+groupTrend = "Trend"
+groupVolume = "Volume"
+groupATR = "ATR"
+
+emaFastLength = input.int(9, "Fast EMA", group=groupTrend)
+emaSlowLength = input.int(21, "Slow EMA", group=groupTrend)
+emaTrendLength = input.int(200, "Trend EMA", group=groupTrend)
+
+showEMAs = input.bool(true, "Show EMAs", group=groupTrend)
+
+atrLength = input.int(14, "ATR Length", group=groupATR)
+
+volumeLength = input.int(20, "Average Volume Length", group=groupVolume)
+
+groupAccumulation = "Accumulation"
+
+wickRatioThreshold = input.float(0.50, "Min Lower/Upper Wick Ratio", step=0.05, group=groupAccumulation)
+smallBodyThreshold = input.float(0.35, "Max Body Ratio", step=0.05, group=groupAccumulation)
+zoneATRMultiplier = input.float(0.20, "Liquidity Zone Width (ATR)", step=0.05, group="Liquidity")
+
+groupRisk = "Risk"
+slATRBuffer = input.float(0.20, "SL ATR Buffer", step=0.05, group=groupRisk)
+
+tp1RR = input.float(1.0, "TP1 RR", step=0.5, group=groupRisk)
+tp2RR = input.float(2.0, "TP2 RR", step=0.5, group=groupRisk)
+tp3RR = input.float(3.0, "TP3 RR", step=0.5, group=groupRisk)
+
+minimumConfidence = input.int(80, "Minimum Confidence", minval=50, maxval=100, group=groupRisk)
+
+//==================================================
+// DISPLAY
+//==================================================
+
+groupDisplay = "Display"
+
+beginnerMode = input.bool(true, "Beginner Mode", group=groupDisplay)
+showStructure = input.bool(false, "Show Market Structure", group=groupDisplay)
+showLiquidity = input.bool(false, "Show Liquidity Labels", group=groupDisplay)
+showDebug = input.bool(false, "Show Debug Labels", group=groupDisplay)
+
+showTradeZones = input.bool(true, "Show Trade Zones", group=groupDisplay)
+
+//==================================================
+// FUNCTIONS
+//==================================================
+
+// Trend
+f_isBullTrend(_fast, _slow, _trend, _close) =>
+    _fast > _slow and _slow > _trend and _close > _trend
+
+f_isBearTrend(_fast, _slow, _trend, _close) =>
+    _fast < _slow and _slow < _trend and _close < _trend
+
+// Relative Volume
+f_relativeVolume(_volume, _avgVolume) =>
+    _avgVolume != 0 ? _volume / _avgVolume : 0.0
+
+// ATR Ratio
+f_atrRatio(_atr, _atrAvg) =>
+    _atrAvg != 0 ? _atr / _atrAvg : 0.0
+
+// Sweep Detection
+f_bullSweep(_low, _zoneLow, _zoneHigh, _lastSwingLow) =>
+    not na(_lastSwingLow) and _low < _zoneLow and close > _zoneHigh
+
+f_bearSweep(_high, _zoneHigh, _zoneLow, _lastSwingHigh) =>
+    not na(_lastSwingHigh) and _high > _zoneHigh and close < _zoneLow
+
+//==================================================
+// STRUCTURE FUNCTIONS
+//==================================================
+
+// Break of Structure
+f_bullBOS(_close, _lastSwingHigh) =>
+    not na(_lastSwingHigh) and _close > _lastSwingHigh
+
+f_bearBOS(_close, _lastSwingLow) =>
+    not na(_lastSwingLow) and _close < _lastSwingLow
+
+// Change of Character
+f_bullCHOCH(_bearTrend, _close, _lastSwingHigh) =>
+    _bearTrend and not na(_lastSwingHigh) and _close > _lastSwingHigh
+
+f_bearCHOCH(_bullTrend, _close, _lastSwingLow) =>
+    _bullTrend and not na(_lastSwingLow) and _close < _lastSwingLow
+
+//==================================================
+// SCORING FUNCTIONS
+//==================================================
+
+f_scoreTrend(_bullTrend, _bearTrend) => (_bullTrend or _bearTrend) ? 20 : 0
+
+f_scoreVolume(_relativeVolume) => _relativeVolume >= 2.0 ? 20 : _relativeVolume >= 1.5 ? 15 : _relativeVolume >= 1.2 ? 10 : 0
+
+f_scoreLiquidity(_bullSweep, _bearSweep) => (_bullSweep or _bearSweep) ? 20 : 0
+
+f_scoreStructure(_bullBOS, _bearBOS, _bullCHOCH, _bearCHOCH) => ((_bullBOS or _bearBOS) ? 10 : 0) + ((_bullCHOCH or _bearCHOCH) ? 10 : 0)
+
+f_scoreFlow(_bullAccumulation, _bearDistribution) => (_bullAccumulation or _bearDistribution) ? 20 : 0
+
+f_scoreRetest(_bullRetest, _bearRetest) => (_bullRetest or _bearRetest) ? 20 : 0
+
+f_scoreLiquidityStrength(_strength) => _strength >= 90 ? 20 : _strength >= 75 ? 15 : _strength >= 60 ? 10 : 0
+
+//==================================================
+// RISK FUNCTIONS
+//==================================================
+
+f_buySL(_lastSwingLow, _atr, _buffer) =>
+    _lastSwingLow - (_atr * _buffer)
+
+f_sellSL(_lastSwingHigh, _atr, _buffer) =>
+    _lastSwingHigh + (_atr * _buffer)
+    
+
+//==================================================
+// TAKE PROFIT FUNCTIONS
+//==================================================
+
+f_buyTP(_entry, _sl, _rr) =>
+    _entry + ((_entry - _sl) * _rr)
+
+f_sellTP(_entry, _sl, _rr) =>
+    _entry - ((_sl - _entry) * _rr)
+
+//==================================================
+// EMA ENGINE
+//==================================================
+
+emaFast = ta.ema(close, emaFastLength)
+emaSlow = ta.ema(close, emaSlowLength)
+emaTrend = ta.ema(close, emaTrendLength)
+
+bullTrend = f_isBullTrend(emaFast, emaSlow, emaTrend, close)
+bearTrend = f_isBearTrend(emaFast, emaSlow, emaTrend, close)
+
+trendState = bullTrend ? "BULLISH" : bearTrend ? "BEARISH" : "SIDEWAYS"
+
+//==================================================
+// ATR ENGINE
+//==================================================
+
+atr = ta.atr(atrLength)
+atrAverage = ta.sma(atr, atrLength)
+atrRatio = f_atrRatio(atr, atrAverage)
+
+//==================================================
+// VOLUME ENGINE
+//==================================================
+
+avgVolume = ta.sma(volume, volumeLength)
+relativeVolume = f_relativeVolume(volume, avgVolume)
+
+volumeState =
+     relativeVolume >= 2.5 ? "INST" :
+     relativeVolume >= 1.8 ? "VERY HIGH" :
+     relativeVolume >= 1.2 ? "HIGH" :
+     relativeVolume >= 0.8 ? "NORMAL" :
+     "LOW"
+
+//==================================================
+// SWING ENGINE
+//==================================================
+
+pivotLength = input.int(5, "Pivot Strength", minval=2, maxval=20, group="Liquidity")
+equalToleranceATR = input.float(0.15, "Equal High/Low ATR Tolerance", step=0.01, group="Liquidity")
+
+pivotHigh = ta.pivothigh(high, pivotLength, pivotLength)
+pivotLow  = ta.pivotlow(low, pivotLength, pivotLength)
+
+var float lastSwingHigh = na
+var float prevSwingHigh = na
+
+var float lastSwingLow = na
+var float prevSwingLow = na
+
+if not na(pivotHigh)
+    prevSwingHigh := lastSwingHigh
+    lastSwingHigh := pivotHigh
+
+if not na(pivotLow)
+    prevSwingLow := lastSwingLow
+    lastSwingLow := pivotLow
+
+//==================================================
+// MARKET STRUCTURE
+//==================================================
+
+higherHigh = not na(prevSwingHigh) and not na(lastSwingHigh) and lastSwingHigh > prevSwingHigh
+lowerHigh = not na(prevSwingHigh) and not na(lastSwingHigh) and lastSwingHigh < prevSwingHigh
+
+higherLow = not na(prevSwingLow) and not na(lastSwingLow) and lastSwingLow > prevSwingLow
+lowerLow = not na(prevSwingLow) and not na(lastSwingLow) and lastSwingLow < prevSwingLow
+
+bullStructure = higherHigh and higherLow
+bearStructure = lowerHigh and lowerLow
+
+//==================================================
+// STRUCTURE LEVELS
+//==================================================
+
+bullBreakLevel = higherHigh ? lastSwingHigh : na
+bearBreakLevel = lowerLow ? lastSwingLow : na
+
+//==================================================
+// PREVIOUS DAY LEVELS
+//==================================================
+
+previousDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+previousDayLow  = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_off)
+
+//==================================================
+// LIQUIDITY ZONES
+//==================================================
+
+zoneWidth = atr * zoneATRMultiplier
+
+upperSupplyZone = lastSwingHigh + zoneWidth
+lowerSupplyZone = lastSwingHigh - zoneWidth
+
+upperDemandZone = lastSwingLow + zoneWidth
+lowerDemandZone = lastSwingLow - zoneWidth
+
+//==================================================
+// LIQUIDITY STRENGTH
+//==================================================
+
+distanceToSupply = not na(lastSwingHigh) ? math.abs(close - lastSwingHigh) : na
+distanceToDemand = not na(lastSwingLow) ? math.abs(close - lastSwingLow) : na
+
+dynamicSupplyStrength = not na(distanceToSupply) ? math.max(0.0, 100.0 - (distanceToSupply / atr) * 20.0) : 0.0
+dynamicDemandStrength = not na(distanceToDemand) ? math.max(0.0, 100.0 - (distanceToDemand / atr) * 20.0) : 0.0
+
+//==================================================
+// EQUAL HIGH / LOW ENGINE
+//==================================================
+
+tolerance = atr * equalToleranceATR
+
+equalHigh = not na(lastSwingHigh) and math.abs(high - lastSwingHigh) <= tolerance
+
+equalLow = not na(lastSwingLow) and math.abs(low - lastSwingLow) <= tolerance
+
+//==================================================
+// LIQUIDITY SWEEP ENGINE
+//==================================================
+
+bullSweep = f_bullSweep(low, lowerDemandZone, upperDemandZone, lastSwingLow)
+bearSweep = f_bearSweep(high, upperSupplyZone, lowerSupplyZone, lastSwingHigh)
+
+supplyStrength = math.abs(close - lastSwingHigh) <= zoneWidth ? 100 : 60
+demandStrength = math.abs(close - lastSwingLow) <= zoneWidth ? 100 : 60
+
+//==================================================
+// BREAK OF STRUCTURE (BOS)
+//==================================================
+
+bullBOS = not na(bullBreakLevel) and close > bullBreakLevel
+bearBOS = not na(bearBreakLevel) and close < bearBreakLevel
+
+//==================================================
+// CHANGE OF CHARACTER (CHOCH)
+//==================================================
+
+bullCHOCH = bearStructure and not na(lastSwingHigh) and close > lastSwingHigh
+bearCHOCH = bullStructure and not na(lastSwingLow) and close < lastSwingLow
+
+//==================================================
+// RETEST ENGINE
+//==================================================
+
+retestBars = input.int(5, "Retest Lookback", minval=1, maxval=20, group="Liquidity")
+
+bullRetest = bullBOS and ta.lowest(low, retestBars) <= lastSwingHigh and close > lastSwingHigh
+bearRetest = bearBOS and ta.highest(high, retestBars) >= lastSwingLow and close < lastSwingLow
+
+//==================================================
+// ACCUMULATION / DISTRIBUTION ENGINE
+//==================================================
+
+candleRange = high - low
+bodySize = math.abs(close - open)
+
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+bodyRatio = candleRange > 0 ? bodySize / candleRange : 0.0
+lowerWickRatio = candleRange > 0 ? lowerWick / candleRange : 0.0
+upperWickRatio = candleRange > 0 ? upperWick / candleRange : 0.0
+
+bullAccumulation = relativeVolume >= 1.2 and lowerWickRatio >= wickRatioThreshold and bodyRatio <= smallBodyThreshold
+bearDistribution = relativeVolume >= 1.2 and upperWickRatio >= wickRatioThreshold and bodyRatio <= smallBodyThreshold
+
+//==================================================
+// CONFIDENCE ENGINE
+//==================================================
+trendScore = f_scoreTrend(bullTrend, bearTrend)
+
+if bullStructure
+    trendScore += 10
+
+if bearStructure
+    trendScore += 10
+volumeScore = f_scoreVolume(relativeVolume)
+strengthScore = f_scoreLiquidityStrength(math.max(dynamicSupplyStrength, dynamicDemandStrength))
+liquidityScore = math.max(f_scoreLiquidity(bullSweep, bearSweep), strengthScore)
+structureScore = f_scoreStructure(bullBOS, bearBOS, bullCHOCH, bearCHOCH)
+flowScore = f_scoreFlow(bullAccumulation, bearDistribution)
+retestScore = f_scoreRetest(bullRetest, bearRetest)
+
+confidenceScore = trendScore + volumeScore + liquidityScore + structureScore + flowScore + retestScore
+
+
+buySL = f_buySL(lastSwingLow, atr, slATRBuffer)
+sellSL = f_sellSL(lastSwingHigh, atr, slATRBuffer)
+
+buyEntry = close
+sellEntry = close
+
+buyTP1 = f_buyTP(buyEntry, buySL, tp1RR)
+buyTP2 = f_buyTP(buyEntry, buySL, tp2RR)
+buyTP3 = f_buyTP(buyEntry, buySL, tp3RR)
+
+sellTP1 = f_sellTP(sellEntry, sellSL, tp1RR)
+sellTP2 = f_sellTP(sellEntry, sellSL, tp2RR)
+sellTP3 = f_sellTP(sellEntry, sellSL, tp3RR)
+
+//==================================================
+// SETUP ENGINE
+//==================================================
+
+buySetup = bullTrend and bullSweep and bullBOS and bullRetest and bullAccumulation and confidenceScore >= minimumConfidence
+sellSetup = bearTrend and bearSweep and bearBOS and bearRetest and bearDistribution and confidenceScore >= minimumConfidence
+
+buySignal = buySetup and confidenceScore >= minimumConfidence
+sellSignal = sellSetup and confidenceScore >= minimumConfidence
+
+plotchar(buySignal, title="Buy Signal", char="B", location=location.belowbar, color=color.lime)
+plotchar(sellSignal, title="Sell Signal", char="S", location=location.abovebar, color=color.red)
+//==================================================
+// TRADE VISUALIZATION ENGINE
+//==================================================
+
+groupTrade = "Trade Visualization"
+
+tradeProjection = input.int(40, "Projection Bars", minval=5, maxval=100, group=groupTrade)
+
+var box profitBox = na
+var box riskBox = na
+
+var line entryLine = na
+
+var label entryLbl = na
+var label slLbl = na
+var label tp1Lbl = na
+var label tp2Lbl = na
+var label tp3Lbl = na
+
+//==================================================
+// TRADE OBJECT FUNCTIONS
+//==================================================
+
+f_clearTradeObjects() =>
+
+    if not na(profitBox)
+        box.delete(profitBox)
+
+    if not na(riskBox)
+        box.delete(riskBox)
+
+    if not na(entryLine)
+        line.delete(entryLine)
+
+    if not na(entryLbl)
+        label.delete(entryLbl)
+
+    if not na(slLbl)
+        label.delete(slLbl)
+
+    if not na(tp1Lbl)
+        label.delete(tp1Lbl)
+
+    if not na(tp2Lbl)
+        label.delete(tp2Lbl)
+
+    if not na(tp3Lbl)
+        label.delete(tp3Lbl)
+
+//==================================================
+// TRADE OBJECT MANAGER
+//==================================================
+
+if showTradeZones and buySignal
+
+    f_clearTradeObjects()
+
+    entryLine := line.new(
+         bar_index,
+         buyEntry,
+         bar_index + tradeProjection,
+         buyEntry,
+         color=color.white,
+         width=2)
+
+    profitBox := box.new(
+         left=bar_index,
+         top=buyTP3,
+         right=bar_index + tradeProjection,
+         bottom=buyEntry,
+         bgcolor=color.new(color.green,90),
+         border_color=color.green)
+
+    riskBox := box.new(
+         left=bar_index,
+         top=buyEntry,
+         right=bar_index + tradeProjection,
+         bottom=buySL,
+         bgcolor=color.new(color.red,90),
+         border_color=color.red)
+
+        // BUY Label
+    entryLbl := label.new(
+        bar_index,
+        buyEntry,
+        "🟢 BUY",
+        style=label.style_label_up,
+        color=color.green,
+        textcolor=color.white,
+        size=size.normal)
+
+    // SL
+    slLbl := label.new(
+        bar_index + tradeProjection,
+        buySL,
+        "SL",
+        style=label.style_label_left,
+        color=color.red,
+        textcolor=color.white,
+        size=size.small)
+
+    // TP1
+    tp1Lbl := label.new(
+        bar_index + tradeProjection,
+        buyTP1,
+        "TP1",
+        style=label.style_label_left,
+        color=color.green,
+        textcolor=color.white,
+        size=size.small)
+
+    // TP2
+    tp2Lbl := label.new(
+        bar_index + tradeProjection,
+        buyTP2,
+        "TP2",
+        style=label.style_label_left,
+        color=color.green,
+        textcolor=color.white,
+        size=size.small)
+
+    // TP3
+    tp3Lbl := label.new(
+        bar_index + tradeProjection,
+        buyTP3,
+        "TP3",
+        style=label.style_label_left,
+        color=color.green,
+        textcolor=color.white,
+        size=size.small)
+
+
+if showTradeZones and sellSignal
+
+    f_clearTradeObjects()
+
+    entryLine := line.new(
+         bar_index,
+         sellEntry,
+         bar_index + tradeProjection,
+         sellEntry,
+         color=color.white,
+         width=2)
+
+    // Risk Box
+    riskBox := box.new(
+         left=bar_index,
+         top=sellSL,
+         right=bar_index + tradeProjection,
+         bottom=sellEntry,
+         bgcolor=color.new(color.red,85),
+         border_color=color.red)
+
+    // Profit Box
+    profitBox := box.new(
+         left=bar_index,
+         top=sellEntry,
+         right=bar_index + tradeProjection,
+         bottom=sellTP3,
+         bgcolor=color.new(color.green,85),
+         border_color=color.green)
+
+    entryLbl := label.new(
+         bar_index,
+         sellEntry,
+         "🔴 SELL",
+         style=label.style_label_down,
+         color=color.red,
+         textcolor=color.white)
+
+    slLbl := label.new(
+         bar_index + tradeProjection,
+         sellSL,
+         "SL",
+         style=label.style_label_left,
+         color=color.red,
+         textcolor=color.white)
+
+    tp1Lbl := label.new(
+         bar_index + tradeProjection,
+         sellTP1,
+         "TP1",
+         style=label.style_label_left,
+         color=color.green,
+         textcolor=color.white)
+
+    tp2Lbl := label.new(
+         bar_index + tradeProjection,
+         sellTP2,
+         "TP2",
+         style=label.style_label_left,
+         color=color.green,
+         textcolor=color.white)
+
+    tp3Lbl := label.new(
+         bar_index + tradeProjection,
+         sellTP3,
+         "TP3",
+         style=label.style_label_left,
+         color=color.green,
+         textcolor=color.white)
+//==================================================
+// PLOTS
+//==================================================
+
+plot(showEMAs ? emaFast : na, title="EMA 9", linewidth=2, color=color.green)
+plot(showEMAs ? emaSlow : na, title="EMA 21", linewidth=2, color=color.orange)
+plot(showEMAs ? emaTrend : na, title="EMA 200", linewidth=2, color=color.blue)
+
+bgcolor(
+     bullTrend ? color.new(color.green,92) :
+     bearTrend ? color.new(color.red,92) :
+     na)
+
+plot(lastSwingHigh, "Last Swing High", color=color.red, linewidth=1, style=plot.style_linebr)
+plot(lastSwingLow, "Last Swing Low", color=color.lime, linewidth=1, style=plot.style_linebr)
+
+plot(previousDayHigh,
+     title="Previous Day High",
+     color=color.red,
+     linewidth=2,
+     style=plot.style_linebr)
+
+plot(previousDayLow,
+     title="Previous Day Low",
+     color=color.green,
+     linewidth=2,
+     style=plot.style_linebr)
+
+p1 = plot(upperSupplyZone, display=display.none)
+p2 = plot(lowerSupplyZone, display=display.none)
+
+fill(p1, p2, color=color.new(color.red, 85))
+
+p3 = plot(upperDemandZone, display=display.none)
+p4 = plot(lowerDemandZone, display=display.none)
+
+fill(p3, p4, color=color.new(color.green, 85))
+
+plot(buySetup ? buySL : na,
+     "Buy SL",
+     color=color.red,
+     linewidth=2,
+     style=plot.style_linebr)
+
+plot(sellSetup ? sellSL : na,
+     "Sell SL",
+     color=color.red,
+     linewidth=2,
+     style=plot.style_linebr)
+
+plot(buySetup ? buyTP1 : na, "Buy TP1", color=color.lime)
+plot(buySetup ? buyTP2 : na, "Buy TP2", color=color.green)
+plot(buySetup ? buyTP3 : na, "Buy TP3", color=color.teal)
+
+plot(sellSetup ? sellTP1 : na, "Sell TP1", color=color.orange)
+plot(sellSetup ? sellTP2 : na, "Sell TP2", color=color.red)
+plot(sellSetup ? sellTP3 : na, "Sell TP3", color=color.maroon)
+
+showSignalArrows = input.bool(false, "Show Signal Arrows", group=groupDisplay)
+plotshape(
+     showSignalArrows and buySignal,
+     title="BUY",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=color.lime,
+     size=size.large,
+     text="BUY"
+)
+
+plotshape(
+     showSignalArrows and sellSignal,
+     title="SELL",
+     style=shape.triangledown,
+     location=location.abovebar,
+     color=color.red,
+     size=size.large,
+     text="SELL"
+)
+//==================================================
+// DASHBOARD
+//==================================================
+
+var table dash = table.new(position.top_right, 2, 25)
+
+if barstate.islast
+
+    table.cell(dash,0,0,"NLVE",text_color=color.white,bgcolor=color.blue)
+    table.cell(dash,1,0,"v0.0.2")
+
+    table.cell(dash,0,1,"Trend")
+    table.cell(dash,1,1,trendState)
+
+    table.cell(dash,0,2,"ATR")
+    table.cell(dash,1,2,str.tostring(atrRatio,"#.##"))
+
+    table.cell(dash,0,3,"Volume")
+    table.cell(dash,1,3,volumeState)
+
+    table.cell(dash,0,4,"Rel Vol")
+    table.cell(dash,1,4,str.tostring(relativeVolume,"#.##")+"x")
+
+    trendScore = bullTrend or bearTrend ? 20 : 0
+    volumeScore = relativeVolume >= 1.2 ? 15 : 5
+
+    confidence = trendScore + volumeScore
+
+    table.cell(dash,0,5,"Score")
+    table.cell(dash,1,5,str.tostring(confidence))
+
+    table.cell(dash,0,6,"PD High")
+    table.cell(dash,1,6,str.tostring(previousDayHigh))
+
+    table.cell(dash,0,7,"PD Low")
+    table.cell(dash,1,7,str.tostring(previousDayLow))
+
+    table.cell(dash,0,8,"EQ High")
+    table.cell(dash,1,8,equalHigh ? "YES" : "NO")
+
+    table.cell(dash,0,9,"EQ Low")
+    table.cell(dash,1,9,equalLow ? "YES" : "NO")
+
+    table.cell(dash,0,10,"Sweep")
+    table.cell(dash,1,10,
+        bullSweep ? "BUY" :
+        bearSweep ? "SELL" :
+        "-")
+
+    table.cell(dash,0,11,"BOS")
+    table.cell(dash,1,11,
+        bullBOS ? "BULL" :
+        bearBOS ? "BEAR" :
+        "-")
+
+    table.cell(dash,0,12,"Setup")
+    table.cell(dash,1,12,
+        buySetup ? "BUY" :
+        sellSetup ? "SELL" :
+        "-")
+
+    table.cell(dash,0,13,"Retest")
+    table.cell(dash,1,13,
+        bullRetest ? "BUY" :
+        bearRetest ? "SELL" :
+        "-")
+
+    table.cell(dash,0,14,"Flow")
+    table.cell(dash,1,14,
+        bullAccumulation ? "ACC" :
+        bearDistribution ? "DIST" :
+        "-")
+
+    table.cell(dash,0,15,"Confidence")
+    table.cell(dash,1,15,str.tostring(confidenceScore)+"/100")
+
+    table.cell(dash,0,16,"Liquidity")
+
+    table.cell(
+        dash,
+        1,
+        16,
+        bullTrend
+            ? str.tostring(demandStrength)
+            : str.tostring(supplyStrength)
+    )
+    table.cell(dash,0,17,"CHOCH")
+    table.cell(dash,1,17,
+        bullCHOCH ? "BULL" :
+        bearCHOCH ? "BEAR" :
+        "-")
+
+    table.cell(dash,0,18,"SL")
+    table.cell(
+        dash,
+        1,
+        18,
+        buySetup ? str.tostring(buySL, format.mintick) :
+        sellSetup ? str.tostring(sellSL, format.mintick) :
+        "-"
+    )
+
+    table.cell(dash,0,19,"TP1")
+    table.cell(dash,1,19,buySetup ? str.tostring(buyTP1, format.mintick) : sellSetup ? str.tostring(sellTP1, format.mintick) : "-")
+
+    table.cell(dash,0,20,"TP2")
+    table.cell(dash,1,20,buySetup ? str.tostring(buyTP2, format.mintick) : sellSetup ? str.tostring(sellTP2, format.mintick) : "-")
+
+    table.cell(dash,0,21,"TP3")
+    table.cell(dash,1,21,buySetup ? str.tostring(buyTP3, format.mintick) : sellSetup ? str.tostring(sellTP3, format.mintick) : "-")
+
+    table.cell(dash,0,22,"Signal")
+    table.cell(
+        dash,
+        1,
+        22,
+        buySignal ? "BUY" :
+        sellSignal ? "SELL" :
+        "-"
+    )
+    table.cell(dash,0,23,"Structure")
+    table.cell(
+        dash,
+        1,
+        23,
+        bullStructure ? "BULL" :
+        bearStructure ? "BEAR" :
+        "RANGE"
+    )
+
+    table.cell(dash,0,24,"Liq Strength")
+    table.cell(
+        dash,
+        1,
+        24,
+        str.tostring(math.round(math.max(dynamicSupplyStrength, dynamicDemandStrength))) + "%"
+    )
+
+
+if not na(pivotHigh)
+    label.new(
+         bar_index - pivotLength,
+         pivotHigh,
+         "SH",
+         style=label.style_label_down,
+         color=color.red,
+         textcolor=color.white,
+         size=size.tiny)
+
+if not na(pivotLow)
+    label.new(
+         bar_index - pivotLength,
+         pivotLow,
+         "SL",
+         style=label.style_label_up,
+         color=color.green,
+         textcolor=color.white,
+         size=size.tiny)
+
+if showLiquidity and equalHigh
+    label.new(
+        bar_index,
+        high,
+        "EQH",
+        style=label.style_label_down,
+        color=color.orange,
+        textcolor=color.white,
+        size=size.small)
+
+if showLiquidity and equalLow
+    label.new(
+         bar_index,
+         low,
+         "EQL",
+         style=label.style_label_up,
+         color=color.orange,
+         textcolor=color.white,
+         size=size.small)
+
+if showLiquidity and bullSweep
+    label.new(
+         bar_index,
+         low,
+         "SWEEP BUY",
+         style=label.style_label_up,
+         color=color.lime,
+         textcolor=color.black,
+         size=size.small)
+
+if showLiquidity and bearSweep
+    label.new(
+         bar_index,
+         high,
+         "SWEEP SELL",
+         style=label.style_label_down,
+         color=color.red,
+         textcolor=color.white,
+         size=size.small)
+        
+if showStructure and bullBOS
+    label.new(
+         bar_index,
+         high,
+         "BOS ↑",
+         style=label.style_label_down,
+         color=color.green,
+         textcolor=color.white,
+         size=size.small)
+
+if showStructure and bearBOS
+    label.new(
+         bar_index,
+         low,
+         "BOS ↓",
+         style=label.style_label_up,
+         color=color.red,
+         textcolor=color.white,
+         size=size.small)
+
+if buySetup
+    label.new(
+         bar_index,
+         low,
+         "SETUP",
+         style=label.style_label_up,
+         color=color.green,
+         textcolor=color.white,
+         size=size.normal)
+
+if sellSetup
+    label.new(
+         bar_index,
+         high,
+         "SETUP",
+         style=label.style_label_down,
+         color=color.red,
+         textcolor=color.white,
+         size=size.normal)
+
+if showLiquidity and bullAccumulation
+    label.new(
+        bar_index, 
+        low, 
+        "ACC", 
+        style=label.style_label_up, 
+        color=color.aqua, 
+        textcolor=color.black, 
+        size=size.tiny)
+
+if showLiquidity and bearDistribution
+    label.new(
+        bar_index, 
+        high, 
+        "DIST", 
+        style=label.style_label_down, 
+        color=color.purple, 
+        textcolor=color.white, 
+        size=size.tiny)
+
+if showStructure and bullCHOCH
+    label.new(
+         bar_index,
+         high,
+         "CHOCH ↑",
+         style=label.style_label_down,
+         color=color.teal,
+         textcolor=color.white,
+         size=size.small)
+
+if showStructure and bearCHOCH
+    label.new(
+         bar_index,
+         low,
+         "CHOCH ↓",
+         style=label.style_label_up,
+         color=color.maroon,
+         textcolor=color.white,
+         size=size.small)
+
+if showStructure and higherHigh
+    label.new(bar_index - pivotLength, lastSwingHigh, "HH", style=label.style_label_down, color=color.green, textcolor=color.white, size=size.tiny)
+
+if showStructure and lowerHigh
+    label.new(bar_index - pivotLength, lastSwingHigh, "LH", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+
+if showStructure and higherLow
+    label.new(bar_index - pivotLength, lastSwingLow, "HL", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+
+if showStructure and lowerLow
+    label.new(bar_index - pivotLength, lastSwingLow, "LL", style=label.style_label_up, color=color.red, textcolor=color.white, size=size.tiny)
+
+//==================================================
+// ALERTS
+//==================================================
+
+alertcondition(buySignal, title="NLVE Buy", message="NLVE BUY Signal")
+alertcondition(sellSignal, title="NLVE Sell", message="NLVE SELL Signal")
